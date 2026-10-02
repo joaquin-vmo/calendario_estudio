@@ -5,6 +5,7 @@ calendario.py — Motor de spaced repetition. No necesitas editar este archivo.
   · Lo que ya estudiaste      → progreso.py
 """
 
+import csv
 from datetime import date, timedelta
 from collections import defaultdict
 
@@ -26,20 +27,14 @@ PROGRESO: dict[str, list[date]] = {
 # ══════════════════════════════════════════════════════════════════
 
 DIAS_ES  = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-MESES_ES = {
-    1: "enero",    2: "febrero",   3: "marzo",      4: "abril",
-    5: "mayo",     6: "junio",     7: "julio",       8: "agosto",
-    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
-}
+MESES_ES = [None, "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+            "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
 
+# Si ya registraste algo hoy, el día está cerrado y el plan parte mañana
+HOY = date.today() + timedelta(days=any(date.today() in f for f in PROGRESO.values()))
 
-def _calcular_hoy(progreso: dict) -> date:
-    hoy     = date.today()
-    cerrado = any(hoy in fechas for fechas in progreso.values())
-    return hoy + timedelta(days=1) if cerrado else hoy
-
-
-HOY = _calcular_hoy(PROGRESO)
+# Número global de cada ítem (#01, #02, ...) en el orden de config.py
+IDX = {item["nombre"]: i for i, item in enumerate((it for r in RAMOS for it in r["items"]), 1)}
 
 
 def _dias_entre(inicio: date, fin: date) -> list[date]:
@@ -51,33 +46,27 @@ def _intervalos_adaptativos(primer_dia: date, evaluacion: date) -> list[int]:
     """Extiende INTERVALOS_BASE con factor ×1.8 hasta cubrir el período al examen."""
     margen     = (evaluacion - primer_dia).days - 2
     intervalos = [i for i in INTERVALOS_BASE if i < margen]
-    if not intervalos:
-        return []
-    ultimo = intervalos[-1]
-    while (siguiente := round(ultimo * 1.8)) < margen:
+    while intervalos and (siguiente := round(intervalos[-1] * 1.8)) < margen:
         intervalos.append(siguiente)
-        ultimo = siguiente
     return intervalos
 
 
-def _nueva_sesion(ideal: date, nombre_sesion: str, item: dict, ramo: dict) -> dict:
+def _sesion(item: dict, ramo: dict, sesion: str, es_relleno: bool = False) -> dict:
     return {
         "nombre":     item["nombre"],
         "tipo":       item["tipo"],
         "ramo":       ramo["nombre"],
         "sigla":      ramo["sigla"],
-        "sesion":     nombre_sesion,
+        "sesion":     sesion,
         "peso":       PESOS[item["tipo"]],
         "evaluacion": ramo["fecha_evaluacion"],
-        "es_relleno": False,
-        "completado": False,
-        "_ideal":     ideal,
+        "es_relleno": es_relleno,
     }
 
 
-def _generar_candidatos(progreso: dict) -> list[dict]:
+def _generar_candidatos(progreso: dict) -> list[tuple[date, dict]]:
     """
-    Genera sesiones futuras para cada ítem.
+    Genera (fecha ideal, sesión) futuras para cada ítem de los ramos con examen pendiente.
     Con historial: ancla en la primera fecha real, omite repasos pasados.
     Sin historial: distribuye los ítems uniformemente en el tiempo disponible.
     """
@@ -85,69 +74,54 @@ def _generar_candidatos(progreso: dict) -> list[dict]:
 
     for ramo in RAMOS:
         evaluacion = ramo["fecha_evaluacion"]
-        items      = ramo["items"]
-        dias_disp  = _dias_entre(HOY, evaluacion)
-        n          = len(items)
-        paso       = max(1, max(n, len(dias_disp) // 3) // n)
+        if evaluacion <= HOY:
+            continue
+        items     = ramo["items"]
+        dias_disp = _dias_entre(HOY, evaluacion)
+        paso      = max(len(items), len(dias_disp) // 3) // len(items)
 
         for i, item in enumerate(items):
-            historial  = sorted(progreso.get(item["nombre"], []))
-            primer_dia = historial[0] if historial else dias_disp[min(i * paso, len(dias_disp) - 1)]
-
-            if not historial:
-                if len(dias_disp) < n:
+            historial = sorted(progreso.get(item["nombre"], []))
+            if historial:
+                primer_dia = historial[0]
+            else:
+                if len(dias_disp) < len(items):
                     raise ValueError(f"[{ramo['sigla']}] Sin días suficientes para '{item['nombre']}'.")
-                candidatos.append(_nueva_sesion(primer_dia, "Estudio inicial", item, ramo))
+                primer_dia = dias_disp[i * paso]
+                candidatos.append((primer_dia, _sesion(item, ramo, "Estudio inicial")))
 
-            for j, intervalo in enumerate(_intervalos_adaptativos(primer_dia, evaluacion)):
+            for j, intervalo in enumerate(_intervalos_adaptativos(primer_dia, evaluacion), 1):
                 fecha = primer_dia + timedelta(days=intervalo)
                 if fecha >= HOY:
-                    candidatos.append(_nueva_sesion(fecha, f"Repaso {j + 1}", item, ramo))
+                    candidatos.append((fecha, _sesion(item, ramo, f"Repaso {j}")))
 
-    candidatos.sort(key=lambda c: (c["_ideal"], c["evaluacion"]))
+    candidatos.sort(key=lambda c: (c[0], c[1]["evaluacion"]))
     return candidatos
 
 
-def _rellenar_capacidad(schedule: dict, carga: dict, validos: set) -> None:
+def _rellenar_capacidad(schedule: dict, carga: dict, validos: list) -> None:
     """Rellena días por debajo del mínimo de capacidad con repasos libres."""
-    for dia in sorted(validos):
-        if dia < HOY:
-            continue
-        cap           = CAPACIDAD_POR_DIA[dia.weekday()]
-        ramos_activos = sorted(
-            [r for r in RAMOS if r["fecha_evaluacion"] > dia],
-            key=lambda r: r["fecha_evaluacion"],
-        )
-        if not ramos_activos:
-            continue
-
-        pool      = [(r, item) for r in ramos_activos for item in r["items"]]
+    for dia in validos:
+        minimo    = MIN_FILL_RATIO * CAPACIDAD_POR_DIA[dia.weekday()] - 1e-9
+        cap       = CAPACIDAD_POR_DIA[dia.weekday()] + 1e-9
         ya_en_dia = {s["nombre"] for s in schedule.get(dia, [])}
-
-        while carga[dia] < MIN_FILL_RATIO * cap - 1e-9:
-            added = False
-            for r, item in pool:
-                peso = PESOS[item["tipo"]]
-                if item["nombre"] not in ya_en_dia and carga[dia] + peso <= cap + 1e-9:
-                    schedule[dia].append({
-                        "nombre": item["nombre"], "tipo": item["tipo"],
-                        "ramo": r["nombre"], "sigla": r["sigla"],
-                        "sesion": "Repaso libre", "peso": peso,
-                        "evaluacion": r["fecha_evaluacion"],
-                        "es_relleno": True, "completado": False,
-                    })
-                    carga[dia] += peso
-                    ya_en_dia.add(item["nombre"])
-                    added = True
-                    if carga[dia] >= MIN_FILL_RATIO * cap - 1e-9:
-                        break
-            if not added:
-                break
+        activos   = sorted((r for r in RAMOS if r["fecha_evaluacion"] > dia),
+                           key=lambda r: r["fecha_evaluacion"])
+        for r in activos:
+            for item in r["items"]:
+                if carga[dia] >= minimo:
+                    break
+                if item["nombre"] not in ya_en_dia and carga[dia] + PESOS[item["tipo"]] <= cap:
+                    schedule[dia].append(_sesion(item, r, "Repaso libre", es_relleno=True))
+                    carga[dia] += PESOS[item["tipo"]]
 
 
-def construir_schedule(progreso: dict) -> tuple[dict, dict]:
+def construir_schedule(progreso: dict) -> dict[date, list]:
     evaluacion_global = max(r["fecha_evaluacion"] for r in RAMOS)
-    validos = set(_dias_entre(HOY, evaluacion_global + timedelta(days=1)))
+    if evaluacion_global <= HOY:
+        raise ValueError("Todas las evaluaciones ya pasaron. Actualiza las fechas en config.py.")
+    validos = _dias_entre(HOY, evaluacion_global + timedelta(days=1))
+    validos_set = set(validos)
 
     carga:    dict[date, float] = defaultdict(float)
     schedule: dict[date, list]  = defaultdict(list)
@@ -155,15 +129,14 @@ def construir_schedule(progreso: dict) -> tuple[dict, dict]:
     def _primer_hueco(desde: date, peso: float, deadline: date) -> date | None:
         d = desde
         while d < deadline:
-            if d in validos and carga[d] + peso <= CAPACIDAD_POR_DIA[d.weekday()] + 1e-9:
+            if d in validos_set and carga[d] + peso <= CAPACIDAD_POR_DIA[d.weekday()] + 1e-9:
                 return d
             d += timedelta(days=1)
         return None
 
     omitidos = []
-    for c in _generar_candidatos(progreso):
-        ideal = c.pop("_ideal")
-        dia   = _primer_hueco(ideal, c["peso"], c["evaluacion"])
+    for ideal, c in _generar_candidatos(progreso):
+        dia = _primer_hueco(ideal, c["peso"], c["evaluacion"])
         if dia is None:
             omitidos.append(c)
             continue
@@ -176,7 +149,11 @@ def construir_schedule(progreso: dict) -> tuple[dict, dict]:
             print(f"     · [{o['sigla']}] {o['nombre']} — {o['sesion']}")
 
     _rellenar_capacidad(schedule, carga, validos)
-    return dict(sorted(schedule.items())), dict(carga)
+    return dict(sorted(schedule.items()))
+
+
+def _carga(sesiones: list) -> float:
+    return sum(s["peso"] for s in sesiones)
 
 
 def _resumen_progreso(progreso: dict) -> None:
@@ -204,9 +181,11 @@ def _resumen_progreso(progreso: dict) -> None:
     print()
 
 
-def imprimir_schedule(schedule: dict, carga: dict, progreso: dict) -> None:
+def imprimir_schedule(schedule: dict, progreso: dict) -> None:
     BAR_W    = 16
-    examenes = {r["fecha_evaluacion"]: r for r in RAMOS}
+    examenes = defaultdict(list)
+    for r in RAMOS:
+        examenes[r["fecha_evaluacion"]].append(r)
     color_ramo = {r["sigla"]: _COLORES[i % len(_COLORES)] for i, r in enumerate(RAMOS)} if USAR_COLORES else {}
 
     def _c(sigla, txt):
@@ -222,28 +201,22 @@ def imprimir_schedule(schedule: dict, carga: dict, progreso: dict) -> None:
     print("  Pesos:   " + "  ".join(f"{t}={p}u" for t, p in PESOS.items()))
     print()
 
-    all_items = []
     for r in RAMOS:
         ev = r["fecha_evaluacion"]
         print(f"  {_c(r['sigla'], '[' + r['sigla'] + ']')} {r['nombre']}"
               f"  →  examen {DIAS_ES[ev.weekday()]} {ev.day} de {MESES_ES[ev.month]}")
         for item in r["items"]:
-            all_items.append((r["sigla"], item))
             hist  = progreso.get(item["nombre"], [])
             marca = f"  ✓ estudiado {len(hist)}×" if hist else ""
-            print(f"      {ICONOS.get(item['tipo'], '·')} #{len(all_items):02d}  {item['nombre']}"
+            print(f"      {ICONOS.get(item['tipo'], '·')} #{IDX[item['nombre']]:02d}  {item['nombre']}"
                   f"  [{item['tipo']}, {PESOS[item['tipo']]}u]{marca}")
         print()
 
     print("═" * 76)
     _resumen_progreso(progreso)
 
-    idx_global   = {item["nombre"]: i + 1 for i, (_, item) in enumerate(all_items)}
-    todas_fechas = sorted(set(schedule) | set(examenes))
-
-    for dia in todas_fechas:
-        if dia in examenes:
-            r = examenes[dia]
+    for dia in sorted(set(schedule) | set(examenes)):
+        for r in examenes.get(dia, []):
             print(f"\n  {'─' * 74}")
             print(f"  {_c(r['sigla'], '🎯  EVALUACIÓN')} "
                   f"{_c(r['sigla'], '[' + r['sigla'] + '] ' + r['nombre'])}"
@@ -254,11 +227,11 @@ def imprimir_schedule(schedule: dict, carga: dict, progreso: dict) -> None:
             continue
 
         cap_dia   = CAPACIDAD_POR_DIA[dia.weekday()]
-        carga_dia = carga.get(dia, 0.0)
+        carga_dia = _carga(schedule[dia])
         bloques   = round(min(carga_dia / cap_dia, 1.0) * BAR_W)
         barra     = "▓" * bloques + "░" * (BAR_W - bloques)
-        proximos  = sorted((ev - dia).days for ev in examenes if ev > dia)
-        prox_str  = f"  —  próx. examen en {proximos[0]}d" if proximos else ""
+        proximo   = min(((ev - dia).days for ev in examenes if ev > dia), default=None)
+        prox_str  = f"  —  próx. examen en {proximo}d" if proximo is not None else ""
 
         print(f"  {DIAS_ES[dia.weekday()]} {dia.day:02d}/{dia.month:02d}"
               f"  │{barra}│ {carga_dia:.1f}/{cap_dia:.0f}u ({carga_dia/cap_dia*100:.0f}%){prox_str}")
@@ -266,7 +239,7 @@ def imprimir_schedule(schedule: dict, carga: dict, progreso: dict) -> None:
         for s in sorted(schedule[dia], key=lambda x: (x["es_relleno"], x["sigla"])):
             tag        = _c(s["sigla"], "[" + s["sigla"] + "]")
             sesion_str = ("~ " + s["sesion"]) if s["es_relleno"] else s["sesion"]
-            print(f"    {ICONOS.get(s['tipo'], '·')} {tag} #{idx_global[s['nombre']]:02d}"
+            print(f"    {ICONOS.get(s['tipo'], '·')} {tag} #{IDX[s['nombre']]:02d}"
                   f"  {sesion_str:<18}  {s['nombre']}")
         print()
 
@@ -275,34 +248,28 @@ def imprimir_schedule(schedule: dict, carga: dict, progreso: dict) -> None:
     todas_sesiones   = [s for ss in schedule.values() for s in ss]
     sesiones_prog    = [s for s in todas_sesiones if not s["es_relleno"]]
     sesiones_relleno = [s for s in todas_sesiones if s["es_relleno"]]
-    total_cap        = sum(CAPACIDAD_POR_DIA[d.weekday()] for d in schedule)
-    total_usado      = sum(carga.get(d, 0) for d in schedule)
-    items_con_prog   = sum(1 for r in RAMOS for item in r["items"] if item["nombre"] in progreso)
-    total_items      = sum(len(r["items"]) for r in RAMOS)
+    total_cap        = sum(CAPACIDAD_POR_DIA[d.weekday()] for d in schedule) or 1
+    total_usado      = _carga(todas_sesiones)
+    items_con_prog   = sum(1 for nombre in IDX if nombre in progreso)
 
     print()
     print("  Resumen:")
     print(f"    Días con estudio      : {len(schedule)}")
     print(f"    Sesiones programadas  : {len(sesiones_prog)}  +  {len(sesiones_relleno)} repasos libres")
     print(f"    Utilización           : {total_usado:.1f}/{total_cap:.0f}u  ({total_usado/total_cap*100:.1f}%)")
-    print(f"    Progreso registrado   : {items_con_prog}/{total_items} ítems")
+    print(f"    Progreso registrado   : {items_con_prog}/{len(IDX)} ítems")
     print()
     print("  Por ramo:")
     for r in RAMOS:
         sig   = r["sigla"]
         ses_r = [s for s in sesiones_prog    if s["sigla"] == sig]
         rel_r = [s for s in sesiones_relleno if s["sigla"] == sig]
-        u_r   = sum(s["peso"] for s in ses_r + rel_r)
         print(f"    {_c(sig, '[' + sig + ']')} {r['nombre']:<32}"
-              f"  {len(ses_r):2d} sesiones  +{len(rel_r)} libres  {u_r:.1f}u")
+              f"  {len(ses_r):2d} sesiones  +{len(rel_r)} libres  {_carga(ses_r + rel_r):.1f}u")
     print()
 
 
 def exportar_csv(schedule: dict, path: str = "plan_estudio.csv") -> None:
-    import csv
-    all_items  = [(r["sigla"], item) for r in RAMOS for item in r["items"]]
-    idx_global = {item["nombre"]: i + 1 for i, (_, item) in enumerate(all_items)}
-
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Fecha", "Día", "Ramo", "Sigla", "#", "Ítem", "Tipo",
@@ -311,8 +278,8 @@ def exportar_csv(schedule: dict, path: str = "plan_estudio.csv") -> None:
         for dia, sesiones in schedule.items():
             for s in sesiones:
                 writer.writerow([
-                    dia.strftime("%Y-%m-%d"), DIAS_ES[dia.weekday()],
-                    s["ramo"], s["sigla"], idx_global[s["nombre"]],
+                    dia.isoformat(), DIAS_ES[dia.weekday()],
+                    s["ramo"], s["sigla"], IDX[s["nombre"]],
                     s["nombre"], s["tipo"], s["sesion"],
                     "sí" if s["es_relleno"] else "no",
                     s["peso"], CAPACIDAD_POR_DIA[dia.weekday()],
@@ -327,8 +294,8 @@ def exportar_csv(schedule: dict, path: str = "plan_estudio.csv") -> None:
 
 if __name__ == "__main__":
     try:
-        schedule, carga = construir_schedule(PROGRESO)
-        imprimir_schedule(schedule, carga, PROGRESO)
+        schedule = construir_schedule(PROGRESO)
+        imprimir_schedule(schedule, PROGRESO)
 
         if input("  ¿Exportar plan a CSV? (s/n): ").strip().lower() == "s":
             exportar_csv(schedule)
